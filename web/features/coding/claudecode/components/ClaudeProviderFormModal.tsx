@@ -1,7 +1,8 @@
 import React from 'react';
-import { Modal, Tabs, Form, Input, Select, Space, Button, Alert, message } from 'antd';
-import { EyeInvisibleOutlined, EyeOutlined } from '@ant-design/icons';
+import { Modal, Tabs, Form, Input, Select, Space, Button, Alert, message, AutoComplete, Radio } from 'antd';
+import { EyeInvisibleOutlined, EyeOutlined, CloudDownloadOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
+import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '@/stores';
 import type { ClaudeCodeProvider, ClaudeProviderFormValues, ClaudeSettingsConfig } from '@/types/claudecode';
 import { readOpenCodeConfig } from '@/services/opencodeApi';
@@ -25,6 +26,18 @@ interface ClaudeProviderFormModalProps {
   defaultTab?: 'manual' | 'import';
   onCancel: () => void;
   onSubmit: (values: ClaudeProviderFormValues) => Promise<void>;
+}
+
+// 获取模型 API 响应类型
+interface FetchedModel {
+  id: string;
+  name?: string;
+  ownedBy?: string;
+}
+
+interface FetchModelsResponse {
+  models: FetchedModel[];
+  total: number;
 }
 
 const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
@@ -51,6 +64,10 @@ const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
   const [availableModels, setAvailableModels] = React.useState<{ id: string; name: string }[]>([]);
   const [loadingProviders, setLoadingProviders] = React.useState(false);
   const [processedBaseUrl, setProcessedBaseUrl] = React.useState<string>('');
+  // 动态获取的模型列表
+  const [fetchedModels, setFetchedModels] = React.useState<FetchedModel[]>([]);
+  const [loadingModels, setLoadingModels] = React.useState(false);
+  const [fetchApiType, setFetchApiType] = React.useState<'openai_compat' | 'native'>('openai_compat');
 
   const isEdit = !!provider && !isCopy;
 
@@ -58,6 +75,8 @@ const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
   React.useEffect(() => {
     if (open) {
       setActiveTab(defaultTab);
+      // 重置获取的模型列表
+      setFetchedModels([]);
     }
   }, [open, defaultTab]);
 
@@ -71,6 +90,11 @@ const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
   // 初始化表单
   React.useEffect(() => {
     if (open && provider) {
+      // 如有 sourceProviderId，加载该供应商的自定义模型
+      if (provider.sourceProviderId) {
+        loadOpenCodeProviders();
+      }
+
       let settingsConfig: ClaudeSettingsConfig = {};
       try {
         settingsConfig = JSON.parse(provider.settingsConfig);
@@ -128,6 +152,46 @@ const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
       message.error(t('common.error'));
     } finally {
       setLoadingProviders(false);
+    }
+  };
+
+  // 获取模型列表（调用 fetch_provider_models API）
+  const handleFetchModels = async () => {
+    const baseUrl = form.getFieldValue('baseUrl');
+    const apiKey = form.getFieldValue('apiKey');
+
+    if (!baseUrl) {
+      message.warning(t('claudecode.fetchModels.baseUrlRequired'));
+      return;
+    }
+
+    // 构建 customUrl：在 baseUrl 后追加 /v1/models
+    const base = baseUrl.replace(/\/$/, '');
+    const customUrl = `${base}/v1/models`;
+
+    setLoadingModels(true);
+    try {
+      const response = await invoke<FetchModelsResponse>('fetch_provider_models', {
+        request: {
+          baseUrl: `${base}/v1`,
+          apiKey,
+          apiType: fetchApiType,
+          sdkType: '@ai-sdk/anthropic',
+          customUrl,
+        },
+      });
+
+      setFetchedModels(response.models);
+      if (response.models.length > 0) {
+        message.success(t('claudecode.fetchModels.success', { count: response.models.length }));
+      } else {
+        message.info(t('claudecode.fetchModels.noModels'));
+      }
+    } catch (error) {
+      console.error('Failed to fetch models:', error);
+      message.error(t('claudecode.fetchModels.failed'));
+    } finally {
+      setLoadingModels(false);
     }
   };
 
@@ -199,6 +263,39 @@ const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
     value: model.id,
   }));
 
+  // 计算 AutoComplete 选项（使用动态获取的模型列表）
+  const modelOptions = React.useMemo(() => {
+    const options: { label: string; value: string }[] = [];
+    const seenIds = new Set<string>();
+
+    // 1. 添加动态获取的模型
+    fetchedModels.forEach((model) => {
+      if (!seenIds.has(model.id)) {
+        seenIds.add(model.id);
+        options.push({
+          label: `${model.name || model.id} (${model.id})`,
+          value: model.id,
+        });
+      }
+    });
+
+    // 2. 编辑模式：如有 sourceProviderId，添加该供应商的自定义模型
+    if (isEdit && provider?.sourceProviderId) {
+      const sourceProvider = openCodeProviders.find(p => p.id === provider.sourceProviderId);
+      sourceProvider?.models.forEach((model) => {
+        if (!seenIds.has(model.id)) {
+          seenIds.add(model.id);
+          options.push({
+            label: `${model.name} (${model.id})`,
+            value: model.id,
+          });
+        }
+      });
+    }
+
+    return options;
+  }, [fetchedModels, isEdit, provider, openCodeProviders]);
+
   const renderManualTab = () => (
     <Form
       form={form}
@@ -243,20 +340,81 @@ const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
         />
       </Form.Item>
 
+      {/* 获取模型列表 */}
+      <Form.Item wrapperCol={{ offset: labelCol.span, span: wrapperCol.span }}>
+        <Space direction="vertical" size="small" style={{ width: '100%' }}>
+          <Radio.Group
+            value={fetchApiType}
+            onChange={(e) => setFetchApiType(e.target.value)}
+            size="small"
+          >
+            <Radio value="openai_compat">{t('claudecode.fetchModels.openaiCompat')}</Radio>
+            <Radio value="native">{t('claudecode.fetchModels.native')}</Radio>
+          </Radio.Group>
+          <Space>
+            <Button
+              type="default"
+              icon={<CloudDownloadOutlined />}
+              loading={loadingModels}
+              onClick={handleFetchModels}
+            >
+              {t('claudecode.fetchModels.button')}
+            </Button>
+            {fetchedModels.length > 0 && (
+              <span style={{ color: '#52c41a' }}>
+                {t('claudecode.fetchModels.loaded', { count: fetchedModels.length })}
+              </span>
+            )}
+          </Space>
+        </Space>
+      </Form.Item>
+
       <Form.Item name="model" label={t('claudecode.model.defaultModel')}>
-        <Input placeholder={t('claudecode.model.defaultModelPlaceholder')} />
+        <AutoComplete
+          options={modelOptions}
+          placeholder={t('claudecode.model.defaultModelPlaceholder')}
+          style={{ width: '100%' }}
+          filterOption={(inputValue, option) =>
+            (option?.label.toLowerCase().includes(inputValue.toLowerCase()) ||
+            option?.value.toLowerCase().includes(inputValue.toLowerCase())) ?? false
+          }
+        />
       </Form.Item>
 
       <Form.Item name="haikuModel" label={t('claudecode.model.haikuModel')}>
-        <Input placeholder={t('claudecode.model.haikuModelPlaceholder')} />
+        <AutoComplete
+          options={modelOptions}
+          placeholder={t('claudecode.model.haikuModelPlaceholder')}
+          style={{ width: '100%' }}
+          filterOption={(inputValue, option) =>
+            (option?.label.toLowerCase().includes(inputValue.toLowerCase()) ||
+            option?.value.toLowerCase().includes(inputValue.toLowerCase())) ?? false
+          }
+        />
       </Form.Item>
 
       <Form.Item name="sonnetModel" label={t('claudecode.model.sonnetModel')}>
-        <Input placeholder={t('claudecode.model.sonnetModelPlaceholder')} />
+        <AutoComplete
+          options={modelOptions}
+          placeholder={t('claudecode.model.sonnetModelPlaceholder')}
+          style={{ width: '100%' }}
+          filterOption={(inputValue, option) =>
+            (option?.label.toLowerCase().includes(inputValue.toLowerCase()) ||
+            option?.value.toLowerCase().includes(inputValue.toLowerCase())) ?? false
+          }
+        />
       </Form.Item>
 
       <Form.Item name="opusModel" label={t('claudecode.model.opusModel')}>
-        <Input placeholder={t('claudecode.model.opusModelPlaceholder')} />
+        <AutoComplete
+          options={modelOptions}
+          placeholder={t('claudecode.model.opusModelPlaceholder')}
+          style={{ width: '100%' }}
+          filterOption={(inputValue, option) =>
+            (option?.label.toLowerCase().includes(inputValue.toLowerCase()) ||
+            option?.value.toLowerCase().includes(inputValue.toLowerCase())) ?? false
+          }
+        />
       </Form.Item>
 
       <Form.Item name="notes" label={t('claudecode.provider.notes')}>
